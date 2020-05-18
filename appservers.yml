@@ -1,0 +1,183 @@
+Description: >
+    Dev Tyagi / Udacity Cloud DevOps Project(Udagram), 2020
+    Deploys the Udagram application servers
+
+Parameters:
+    EnvironmentName:
+        Description: An Environment name that will be prefixed to resources
+        Type: String
+        Default: "Udagram"
+
+    AppS3Bucket:
+        Description: S3 bucket name
+        Type: String
+        Default: "s3::*"
+
+
+Resources:
+
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP to load balancer
+      VpcId:
+        Fn::ImportValue: !Sub "${EnvironmentName}-VPC" 
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+
+  WebServerSecGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties: 
+          GroupDescription: Allow http to our hosts and SSH from local only
+          VpcId:
+            Fn::ImportValue: !Sub "${EnvironmentName}-VPC" 
+          SecurityGroupIngress: 
+          - IpProtocol: tcp # Ingress: HTTP access
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+          - IpProtocol: tcp  # Ingress: SSH access
+            FromPort: 22
+            ToPort: 22
+            CidrIp: 0.0.0.0/0
+          SecurityGroupEgress: 
+          - IpProtocol: tcp # Egress: open ports
+            FromPort: 0
+            ToPort: 65535
+            CidrIp: 0.0.0.0/0
+
+  WebAppTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+          HealthCheckIntervalSeconds: 50
+          HealthCheckPath: /
+          HealthCheckProtocol: HTTP
+          HealthCheckTimeoutSeconds: 30
+          HealthyThresholdCount: 2
+          Port: 80
+          Protocol: HTTP
+          UnhealthyThresholdCount: 5
+          VpcId:
+            Fn::ImportValue: !Sub "${EnvironmentName}-VPC" 
+
+  WebAppLaunchConfig: # user data to install web server
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash Also syncing the S3 bucket which stores our file
+          apt-get update -y
+          apt-get install unzip awscli -y
+          apt-get install apache2 -y
+          systemctl start apache2.service
+          sudo chown ubuntu:ubuntu /var/www/ -R
+          cd /var/www/html
+          aws s3 sync ${AppS3Bucket} .
+      ImageId: ami-07b4f3c02c7f83d59
+      IamInstanceProfile: !Ref IAMProfile
+      SecurityGroups:
+      - Ref: WebServerSecGroup
+      InstanceType: t2.micro
+      BlockDeviceMappings:
+      - DeviceName: "/dev/sdk"
+        Ebs:
+          VolumeSize: '10'
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+
+  IAMPolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: s3AllowAccess 
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - "s3:Get*"
+          - "s3:List*"
+          Resource: "*"
+      Roles:
+      - !Ref EC2Role
+
+  IAMProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - !Ref EC2Role
+
+  WebAppGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue:
+          !Sub "${EnvironmentName}-PR-SNL"
+      LaunchConfigurationName:
+        Ref: WebAppLaunchConfig
+      MaxSize: '5'
+      MinSize: '3'
+      TargetGroupARNs:
+      - Ref: WebAppTargetGroup
+
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PU-SN1"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PU-SN2"
+      SecurityGroups:
+      - Ref: LBSecGroup
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: WebAppTargetGroup
+      LoadBalancerArn:
+        Ref: WebAppLB 
+      Port: '80'
+      Protocol: HTTP
+
+  ALBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties: 
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebAppTargetGroup'
+      Conditions:
+        - Field: path-pattern
+          Values: [/]
+      ListenerArn: !Ref 'Listener'
+      Priority: 1
+
+
+Outputs:
+  
+  LoadBalancerDNS:
+    Description: LoadBalancer DNS to access the application
+    Value: !Join [ "", [ "http://", !GetAtt WebAppLB.DNSName ] ]
+    Export:
+      Name: !Sub "${EnvironmentName}-LB-DNS"
